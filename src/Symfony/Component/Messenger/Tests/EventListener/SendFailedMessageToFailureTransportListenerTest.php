@@ -16,6 +16,9 @@ use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Event\WorkerMessageFailedEvent;
 use Symfony\Component\Messenger\EventListener\SendFailedMessageToFailureTransportListener;
+use Symfony\Component\Messenger\Retry\RetryStrategyInterface;
+use Symfony\Component\Messenger\Stamp\DelayStamp;
+use Symfony\Component\Messenger\Stamp\ReceivedStamp;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
 use Symfony\Component\Messenger\Transport\Sender\SenderInterface;
 
@@ -29,6 +32,10 @@ class SendFailedMessageToFailureTransportListenerTest extends TestCase
             /* @var Envelope $envelope */
             $this->assertInstanceOf(Envelope::class, $envelope);
 
+            $delayStamp = $envelope->last(DelayStamp::class);
+            $this->assertNotNull($delayStamp);
+            $this->assertSame(5000, $delayStamp->getDelay());
+
             /** @var SentToFailureTransportStamp $sentToFailureTransportStamp */
             $sentToFailureTransportStamp = $envelope->last(SentToFailureTransportStamp::class);
             $this->assertNotNull($sentToFailureTransportStamp);
@@ -40,7 +47,15 @@ class SendFailedMessageToFailureTransportListenerTest extends TestCase
         $serviceLocator = $this->createMock(ServiceLocator::class);
         $serviceLocator->expects($this->once())->method('has')->willReturn(true);
         $serviceLocator->expects($this->once())->method('get')->with($receiverName)->willReturn($sender);
-        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator);
+
+        $retryStrategy = $this->createMock(RetryStrategyInterface::class);
+        $retryStrategy->expects($this->once())->method('getWaitingTime')->willReturn(5000);
+
+        $retryStrategyLocator = $this->createMock(ServiceLocator::class);
+        $retryStrategyLocator->expects($this->once())->method('has')->with($receiverName)->willReturn(true);
+        $retryStrategyLocator->expects($this->once())->method('get')->with($receiverName)->willReturn($retryStrategy);
+
+        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator, $retryStrategyLocator);
 
         $exception = new \Exception('no!');
         $envelope = new Envelope(new \stdClass());
@@ -55,7 +70,8 @@ class SendFailedMessageToFailureTransportListenerTest extends TestCase
         $sender->expects($this->never())->method('send');
 
         $serviceLocator = $this->createMock(ServiceLocator::class);
-        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator);
+        $retryStrategyLocator = $this->createStub(ServiceLocator::class);
+        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator, $retryStrategyLocator);
 
         $envelope = new Envelope(new \stdClass());
         $event = new WorkerMessageFailedEvent($envelope, 'my_receiver', new \Exception());
@@ -64,19 +80,40 @@ class SendFailedMessageToFailureTransportListenerTest extends TestCase
         $listener->onMessageFailed($event);
     }
 
-    public function testDoNotRedeliverToFailedWithServiceLocator()
+    public function testDoRedeliverToFailedWithServiceLocator()
     {
         $receiverName = 'my_receiver';
+        $failedReceiver = 'failed_receiver';
 
         $sender = $this->createMock(SenderInterface::class);
-        $sender->expects($this->never())->method('send');
-        $serviceLocator = $this->createMock(ServiceLocator::class);
+        $sender->expects($this->once())->method('send')->with($this->callback(function (Envelope $envelope) use ($receiverName) {
+            $delayStamp = $envelope->last(DelayStamp::class);
+            $this->assertNotNull($delayStamp);
+            $this->assertSame(1000, $delayStamp->getDelay());
 
-        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator);
+            $sentToFailureTransportStamp = $envelope->last(SentToFailureTransportStamp::class);
+            $this->assertNotNull($sentToFailureTransportStamp);
+            $this->assertSame($receiverName, $sentToFailureTransportStamp->getOriginalReceiverName());
+
+            return true;
+        }))->willReturnArgument(0);
+        $serviceLocator = $this->createMock(ServiceLocator::class);
+        $serviceLocator->expects($this->once())->method('has')->willReturn(true);
+        $serviceLocator->expects($this->once())->method('get')->with($receiverName)->willReturn($sender);
+
+        $retryStrategy = $this->createStub(RetryStrategyInterface::class);
+        $retryStrategy->method('getWaitingTime')->willReturn(1000);
+        $retryStrategyLocator = $this->createMock(ServiceLocator::class);
+        $retryStrategyLocator->expects($this->once())->method('has')->willReturn(true);
+        $retryStrategyLocator->expects($this->once())->method('get')->with($failedReceiver)->willReturn($retryStrategy);
+
+        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator, $retryStrategyLocator);
         $envelope = new Envelope(new \stdClass(), [
+            // the received stamp is assumed to be added by the FailedMessageProcessingMiddleware
+            new ReceivedStamp($receiverName),
             new SentToFailureTransportStamp($receiverName),
         ]);
-        $event = new WorkerMessageFailedEvent($envelope, $receiverName, new \Exception());
+        $event = new WorkerMessageFailedEvent($envelope, $failedReceiver, new \Exception());
 
         $listener->onMessageFailed($event);
     }
@@ -87,7 +124,8 @@ class SendFailedMessageToFailureTransportListenerTest extends TestCase
         $sender->expects($this->never())->method('send');
 
         $serviceLocator = $this->createMock(ServiceLocator::class);
-        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator, null);
+        $retryStrategyLocator = $this->createStub(ServiceLocator::class);
+        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator, $retryStrategyLocator);
 
         $exception = new \Exception('no!');
         $envelope = new Envelope(new \stdClass());
@@ -115,8 +153,9 @@ class SendFailedMessageToFailureTransportListenerTest extends TestCase
         $serviceLocator = $this->createMock(ServiceLocator::class);
         $serviceLocator->method('has')->with($receiverName)->willReturn(true);
         $serviceLocator->method('get')->with($receiverName)->willReturn($sender);
+        $retryStrategyLocator = $this->createStub(ServiceLocator::class);
 
-        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator);
+        $listener = new SendFailedMessageToFailureTransportListener($serviceLocator, $retryStrategyLocator);
 
         $exception = new \Exception('no!');
         $envelope = new Envelope(new \stdClass());
